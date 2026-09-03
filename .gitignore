@@ -1,0 +1,8 @@
+*.gem
+/pkg/
+/tmp/
+/.bundle/
+/Gemfile.lock
+.DS_Store
+* [2-9].*
+* 1[0-9].*

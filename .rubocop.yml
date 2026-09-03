@@ -1,0 +1,97 @@
+plugins:
+  - rubocop-performance
+  - rubocop-fluentd
+
+AllCops:
+  Exclude:
+    - 'lib/opentelemetry/**/*'
+    - 'vendor/bundle/**/*'
+  NewCops: enable
+  SuggestExtensions: false
+  TargetRubyVersion: 3.1
+
+# rubocop-fluentd
+Lint/FluentdPluginLogScope:
+  AssumeConfigLogLevel: 'info'
+  Enabled: true
+Lint/FluentdPluginConfigParamDefaultTime:
+  Enabled: true
+Lint/FluentdPluginIgnoreStandardError:
+  Enabled: true
+Performance/FluentdPluginLogStringInterpolation:
+  Enabled: true
+
+# rubocop
+Gemspec/DevelopmentDependencies:
+  Enabled: false
+
+Layout/LineLength:
+  Enabled: false
+
+Lint/UnusedMethodArgument:
+  Enabled: false
+
+Lint/SuppressedException:
+  Enabled: false
+
+Metrics:
+  Enabled: false
+
+Naming/BlockForwarding:
+  Enabled: false
+
+Naming/MethodParameterName:
+  Enabled: false
+
+Naming/VariableNumber:
+  Enabled: false
+
+Style/ArgumentsForwarding:
+  Enabled: false
+
+Style/ClassAndModuleChildren:
+  Enabled: false
+
+Style/ClassVars:
+  Exclude:
+    - 'test/**/*.rb'
+
+Style/Copyright:
+  Enabled: false
+
+Style/Documentation:
+  Enabled: false
+
+Style/FetchEnvVar:
+  Enabled: false
+
+Style/GuardClause:
+  Enabled: false
+
+Style/IfUnlessModifier:
+  Enabled: false
+
+Style/MixinUsage:
+  Exclude:
+    - 'test/helper.rb'
+
+Style/NumericLiterals:
+  Enabled: false
+
+Style/PercentLiteralDelimiters:
+  Enabled: false
+
+Style/RequireOrder:
+  Enabled: true
+
+Style/StringConcatenation:
+  Enabled: false
+
+Style/StringHashKeys:
+  Enabled: false
+
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/TrivialAccessors:
+  Enabled: false

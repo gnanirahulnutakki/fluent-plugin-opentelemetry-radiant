@@ -1,0 +1,23 @@
+fluent-plugin-opentelemetry-radiant
+Copyright 2026 Radiant Logic, Inc.
+
+This product is a derivative work of fluent-plugins-nursery/fluent-plugin-opentelemetry
+version 0.4.0, Copyright 2025- Shizuo Fujita, licensed under the Apache
+License, Version 2.0. The upstream source is available at
+https://github.com/fluent-plugins-nursery/fluent-plugin-opentelemetry.
+
+The derivative retains the upstream copyright and license notices. Its material
+changes are:
+
+- adds an output mode that converts ordinary Fluentd records into OTLP logs;
+- batches converted records into one ExportLogsServiceRequest per Fluentd chunk;
+- preserves typed scalar, nested map, and nested array values in OTLP AnyValue fields;
+- projects configured record fields into OTLP resource attributes;
+- preserves Fluentd event nanoseconds in OTLP log timestamps;
+- lets the existing HTTP and optional gRPC handlers export prepared log requests;
+- retains the upstream OTLP logs, metrics, and traces relay path; and
+- registers both the `opentelemetry_radiant` and compatibility `opentelemetry`
+  output names.
+
+The generated OpenTelemetry protobuf Ruby files remain derived from the
+OpenTelemetry Protocol project and retain their embedded Apache-2.0 notices.
