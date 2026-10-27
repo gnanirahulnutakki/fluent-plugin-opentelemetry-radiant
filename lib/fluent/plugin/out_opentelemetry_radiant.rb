@@ -13,6 +13,7 @@ require "fluent/plugin/opentelemetry/constant"
 require "fluent/plugin/opentelemetry/http_output_handler"
 require "fluent/plugin/opentelemetry/log_record_builder"
 require "fluent/plugin/output"
+require "fluent/plugin_helper/server"
 require "fluent/msgpack_factory"
 
 require "json"
@@ -37,7 +38,8 @@ module Fluent::Plugin
     Fluent::Plugin.register_output("opentelemetry_radiant", self)
     Fluent::Plugin.register_output("opentelemetry", self)
 
-    helpers :server
+    # Reuse Fluentd's transport parameters without configuring a listening server.
+    include Fluent::PluginHelper::Server::ServerTransportParams
 
     desc "How records are handled: auto-detect relay records, relay all records, or convert all records"
     config_param :mode, :enum, list: %i[auto relay records], default: :auto
@@ -58,8 +60,12 @@ module Fluent::Plugin
     desc "OTLP instrumentation scope name"
     config_param :scope_name, :string, default: "fluent-plugin-opentelemetry-radiant"
 
+    desc "HTTP headers or gRPC metadata sent with every export"
+    config_param :headers, :hash, value_type: :string, secret: true, default: {}
+
     config_section :buffer do
       config_set_default :chunk_keys, ["tag"]
+      config_set_default :chunk_limit_size, 2 * 1024 * 1024
     end
 
     config_section :http, required: false, multi: false, init: false, param_name: :http_config do
@@ -87,6 +93,14 @@ module Fluent::Plugin
     config_section :grpc, required: false, multi: false, init: false, param_name: :grpc_config do
       desc "The endpoint"
       config_param :endpoint, :string, default: "127.0.0.1:4317"
+      desc "Compress request body"
+      config_param :compress, :enum, list: %i[text gzip], default: :text
+      desc "The per-call timeout in seconds"
+      config_param :timeout, :integer, default: 60
+      desc "The interval in seconds to send gRPC keepalive pings"
+      config_param :keepalive_time, :integer, default: 30
+      desc "The timeout in seconds to wait for a keepalive acknowledgement"
+      config_param :keepalive_timeout, :integer, default: 10
     end
 
     config_section :transport, required: false, multi: false, init: false, param_name: :transport_config do
@@ -104,8 +118,8 @@ module Fluent::Plugin
         raise Fluent::ConfigError, "Please configure either <http> or <grpc> section."
       end
 
-      @http_handler = Opentelemetry::HttpOutputHandler.new(@http_config, @transport_config, log) if @http_config
-      @grpc_handler = Opentelemetry::GrpcOutputHandler.new(@grpc_config, @transport_config, log) if @grpc_config
+      @http_handler = Opentelemetry::HttpOutputHandler.new(@http_config, @transport_config, log, @headers) if @http_config
+      @grpc_handler = Opentelemetry::GrpcOutputHandler.new(@grpc_config, @transport_config, log, @headers) if @grpc_config
       @log_record_builder = Opentelemetry::LogRecordBuilder.new(
         body_key: @body_key,
         body_format: @body_format,
@@ -116,6 +130,14 @@ module Fluent::Plugin
         resource_attributes_from_record: @resource_attributes_from_record,
         scope_name: @scope_name
       )
+    end
+
+    def start
+      super
+
+      if @http_config && @transport_config.protocol == :tls && @transport_config.insecure
+        log.warn "OTLP/HTTP TLS certificate verification is off (insecure true)"
+      end
     end
 
     def multi_workers_ready?

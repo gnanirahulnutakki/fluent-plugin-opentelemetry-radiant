@@ -7,6 +7,8 @@ by Shizuo Fujita.
 
 The fork retains the upstream OTLP relay and both upstream input plugins, and
 adds an output path that turns ordinary Fluentd records into batched OTLP logs.
+It includes the input size-limit and transport robustness fixes from upstream
+0.5.3, with authenticated HTTP and gRPC exports and client TLS configuration.
 
 > [!IMPORTANT]
 > Do not install this gem alongside `fluent-plugin-opentelemetry`. This gem
@@ -40,6 +42,9 @@ Supported relay types remain `opentelemetry_logs`, `opentelemetry_metrics`, and
   @type opentelemetry_radiant
   mode records
 
+  # Read the token from the Fluentd process environment.
+  headers {"Authorization":"Bearer #{ENV['OTLP_TOKEN']}"}
+
   body_key message
   body_format string
   severity_key severity
@@ -57,6 +62,12 @@ Supported relay types remain `opentelemetry_logs`, `opentelemetry_metrics`, and
     write_timeout 60
     connect_timeout 60
   </http>
+
+  <transport tls>
+    # Omit ca_path to use the system CA roots.
+    ca_path /etc/fluent/certs/collector-ca.pem
+    min_version TLSv1_2
+  </transport>
 
   <buffer tag>
     @type file
@@ -90,7 +101,11 @@ severity key is absent, both fields remain unset/defaulted.
 Converted records in one Fluentd chunk are sent in one
 `ExportLogsServiceRequest`. Delivery is at least once: if any relay or converted
 export fails, Fluentd retries the chunk and a previously accepted request can be
-delivered again.
+delivered again. The default buffer `chunk_limit_size` is **2 MiB**, with
+`chunk_keys ["tag"]`. This leaves headroom below common 4 MiB gRPC receiver
+limits because conversion can enlarge the message. It is not a strict encoded
+request limit: large records and attributes can still exceed a receiver's limit.
+Tune chunk sizes against the actual encoded requests and receiver settings.
 
 ## Relay configuration
 
@@ -108,9 +123,113 @@ This remains compatible with the output emitted by the upstream
 </match>
 ```
 
-The HTTP path sends `application/x-protobuf` and preserves upstream compression,
-timeout, retryable-response, and unrecoverable-response behavior. Optional gRPC
-support still requires the `grpc` gem to be installed separately.
+The HTTP path sends `application/x-protobuf`. Optional gRPC support requires the
+`grpc` gem to be installed separately. The transport settings below apply to all
+output modes and to relay logs, metrics, and traces.
+
+## Authentication and HTTP TLS
+
+Top-level `headers` is a hash of string values (default `{}`). Every export uses
+these headers for HTTP or their lowercase keys for gRPC metadata. Fluentd masks
+the entire hash in its configuration dump. `Content-Type` and `Content-Encoding`
+are reserved, case-insensitively; configured values for them are ignored.
+Keep tokens in the process environment or your existing secret management system.
+
+```conf
+<match fid.**>
+  @type opentelemetry_radiant
+  mode records
+  headers {"Authorization":"Bearer #{ENV['OTLP_TOKEN']}","X-Tenant-ID":"fid"}
+  <http>
+    endpoint https://collector.example.com:4318/
+    compress gzip
+    read_timeout 60
+    write_timeout 60
+    connect_timeout 60
+  </http>
+  <transport tls>
+    ca_path /etc/fluent/certs/ca.pem
+    # Set both for mutual TLS; omit both for server authentication only.
+    cert_path /etc/fluent/certs/client.pem
+    private_key_path /etc/fluent/certs/client-key.pem
+    private_key_passphrase "#{ENV['OTLP_KEY_PASSPHRASE']}"
+    min_version TLSv1_2
+    max_version TLSv1_3
+  </transport>
+</match>
+```
+
+The HTTP endpoint is a base URL. Trailing slashes are removed before appending
+`/v1/logs`, `/v1/metrics`, or `/v1/traces`. Use an `https://` URL for encryption.
+`<transport tls>` supplies the CA, client certificate, key, passphrase, and TLS
+version bounds to Excon. Omit `ca_path` for default system trust. `insecure true`
+disables certificate verification only on this output's HTTP connections and
+logs one warning at start; it does not change process-wide Excon defaults.
+HTTP connections are persistent and reused across exports.
+
+## gRPC TLS and options
+
+```conf
+<match fid.**>
+  @type opentelemetry_radiant
+  mode records
+  headers {"Authorization":"Bearer #{ENV['OTLP_TOKEN']}"}
+  <grpc>
+    endpoint collector.example.com:4317
+    compress gzip
+    timeout 60
+    keepalive_time 30
+    keepalive_timeout 10
+  </grpc>
+  <transport tls>
+    ca_path /etc/fluent/certs/ca.pem
+    # Optional mutual TLS:
+    cert_path /etc/fluent/certs/client.pem
+    private_key_path /etc/fluent/certs/client-key.pem
+  </transport>
+</match>
+```
+
+The gRPC endpoint must be `host:port` (or `[IPv6]:port`), without `http://` or
+`https://`. `<transport tls>` selects a secure channel. Omit `ca_path` to use
+gRPC's default system roots; omit the client cert and key unless mutual TLS is
+required. TLS files are read at configuration time, and unreadable files produce
+a `Fluent::ConfigError` identifying the path. An encrypted client key can use
+`private_key_passphrase`. Without `<transport tls>`, gRPC uses plaintext.
+`insecure true` is rejected for gRPC; supply the server's CA using `ca_path`.
+The HTTP `min_version` / `max_version` settings are not applied to gRPC, whose
+TLS negotiation is managed by gRPC core.
+
+| gRPC option | Default | Meaning |
+|---|---|---|
+| `compress` | `text` | `text` sends uncompressed messages; `gzip` enables gRPC gzip compression. |
+| `timeout` | `60` | Deadline in seconds, refreshed for every call. |
+| `keepalive_time` | `30` | Interval in seconds between gRPC keepalive pings. |
+| `keepalive_timeout` | `10` | Seconds to wait for a ping acknowledgement. |
+
+Stubs and channels are reused. Keepalive pings are permitted without active
+calls; coordinate the interval with the backend's keepalive policy.
+
+## Delivery and retries
+
+All HTTP **2xx** responses acknowledge success. HTTP `400` is unrecoverable.
+The default retryable HTTP codes are `429`, `502`, `503`, and `504`, configurable
+with `<http> retryable_response_codes`. Other non-2xx responses are unrecoverable
+by default; `error_response_as_unrecoverable false` logs and acknowledges those
+other responses instead. Connection and DNS errors remain retryable.
+
+For ordinary-record gRPC exports, `CANCELLED`, `DEADLINE_EXCEEDED`, `ABORTED`,
+`OUT_OF_RANGE`, `UNAVAILABLE`, `DATA_LOSS`, and `RESOURCE_EXHAUSTED` raise a
+retryable error for Fluentd's buffer backoff. All other gRPC error statuses raise
+`Fluent::UnrecoverableError` with the code name and server details. Relay-mode
+gRPC status exceptions retain upstream behavior and remain retryable through
+Fluentd. Configure buffer retry policy to match operational needs.
+
+Successful HTTP and gRPC log responses with `partial_success.rejected_log_records`
+greater than zero log a warning with the count and backend error message. They
+are acknowledged without retry to avoid resending accepted records. Configured
+header values are redacted from these warnings and ordinary-record gRPC status
+errors.
 
 ## Input plugins
 
@@ -121,7 +240,29 @@ The upstream inputs remain registered under their original names:
 - `@type opentelemetry_metrics` emits Fluentd internal metrics as OTLP relay
   records.
 
-Their configuration and behavior are unchanged from upstream 0.4.0.
+The OTLP HTTP input now limits the streamed request body and decompressed gzip
+body. Configure limits inside its `<http>` section:
+
+```conf
+<source>
+  @type opentelemetry
+  tag opentelemetry.${type}
+  <http>
+    bind 0.0.0.0
+    port 4318
+    body_size_limit 32m
+    decompression_size_limit 256m
+  </http>
+</source>
+```
+
+`body_size_limit` defaults to **32 MiB** and `decompression_size_limit` to
+**256 MiB**. Bodies exceeding either limit return HTTP `413`; malformed or
+truncated gzip returns `400`. Requests are closed on success and failure.
+This includes the upstream CVE-2026-44163 / GHSA-2jc5-xhx8-qj6h fix. The gRPC
+input now stops its server during Fluentd shutdown. The internal metrics input
+keeps its upstream 0.4.0 behavior and `fluentd_` metric prefix; no process metrics
+or `get_process_mem` dependency are added.
 
 ## Development
 

@@ -57,10 +57,10 @@ class OpentelemetryRadiantOutputTest < Test::Unit::TestCase
   end
 
   class StaticHttpConnection
-    Response = Struct.new(:status)
+    Response = Struct.new(:status, :body)
 
     def initialize(status)
-      @response = Response.new(status)
+      @response = Response.new(status, "")
     end
 
     def post
@@ -75,8 +75,9 @@ class OpentelemetryRadiantOutputTest < Test::Unit::TestCase
       @requests = []
     end
 
-    def export_request(request)
+    def export_request(request, **_options)
       @requests << request
+      Fluent::Plugin::Opentelemetry::Response::Logs.build
     end
   end
 
@@ -433,21 +434,18 @@ class OpentelemetryRadiantOutputTest < Test::Unit::TestCase
       [[1_788_393_600, { "message" => "wire format" }]]
     )
 
-    prepared_connection = handler.send(
-      :create_http_connection_for,
-      "http://127.0.0.1:4318/v1/logs",
-      prepared.to_proto
-    )
+    prepared_headers, prepared_body = handler.send(:prepare_body, prepared.to_proto)
     relay_record = {
       "type" => "opentelemetry_logs",
       "message" => prepared.to_json
     }
-    relay_uri, relay_connection = handler.send(:create_http_connection, relay_record)
+    relay_uri, relay_headers, relay_body = handler.send(:get_post_data, relay_record)
 
     assert_equal "http://127.0.0.1:4318/v1/logs", relay_uri
-    assert_equal "application/x-protobuf", prepared_connection.data.fetch(:headers).fetch("Content-Type")
-    assert_equal prepared.to_proto, prepared_connection.data.fetch(:body)
-    assert_equal prepared.to_proto, relay_connection.data.fetch(:body)
+    assert_equal "application/x-protobuf", prepared_headers.fetch("Content-Type")
+    assert_equal prepared_headers, relay_headers
+    assert_equal prepared.to_proto, prepared_body
+    assert_equal prepared.to_proto, relay_body
   end
 
   def test_http_relay_keeps_logs_metrics_and_traces_routes_and_protobuf_encoding
@@ -463,10 +461,10 @@ class OpentelemetryRadiantOutputTest < Test::Unit::TestCase
     ]
 
     cases.each do |type, message, path, request_class|
-      uri, connection = handler.send(:create_http_connection, { "type" => type, "message" => message })
+      uri, _headers, body = handler.send(:get_post_data, { "type" => type, "message" => message })
 
       assert_equal "http://127.0.0.1:4318#{path}", uri
-      assert_equal request_class.decode_json(message).to_proto, connection.data.fetch(:body)
+      assert_equal request_class.decode_json(message).to_proto, body
     end
   end
 
@@ -501,8 +499,12 @@ class OpentelemetryRadiantOutputTest < Test::Unit::TestCase
       "fid.access",
       [[1_788_393_600, { "message" => "grpc" }]]
     )
-    config = Struct.new(:endpoint).new("127.0.0.1:4317")
-    handler = Fluent::Plugin::Opentelemetry::GrpcOutputHandler.new(config, nil, nil)
+    grpc_driver = Fluent::Test::Driver::Output.new(Fluent::Plugin::OpentelemetryRadiantOutput).configure(<<~CONFIG)
+      <grpc>
+        endpoint 127.0.0.1:4317
+      </grpc>
+    CONFIG
+    handler = grpc_driver.instance.instance_variable_get(:@grpc_handler)
     service = CapturingGrpcService.new
     handler.define_singleton_method(:logs_service) { service }
 
