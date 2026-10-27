@@ -307,6 +307,18 @@ class OpentelemetryRadiantOutputTest < Test::Unit::TestCase
     assert_equal "Connect", attributes.fetch("OPNAME").string_value
   end
 
+  def test_chunk_with_invalid_binary_text_keeps_all_records_in_one_request
+    driver = create_driver("mode records")
+    messages = ["first", "bad\xFFbyte".b, "a\xC2\xA0b".b, "last"]
+    events = messages.map { |message| [1_788_393_600, { "message" => message }] }
+
+    request = capture_request(driver, "fid.access", events)
+    decoded = request.class.decode(request.to_proto)
+    _, scope_logs = resource_and_scope(decoded)
+
+    assert_equal ["first", "bad\uFFFDbyte", "a\u00A0b", "last"], scope_logs.log_records.map { |record| record.body.string_value }
+  end
+
   def test_kvlist_body_contains_the_whole_record_with_native_types
     driver = create_driver(<<~CONFIG)
       mode records

@@ -53,7 +53,7 @@ class Fluent::Plugin::Opentelemetry::LogRecordBuilder
           resource: resource_v1::Resource.new(attributes: resource_attributes(events.first[1])),
           scope_logs: [
             logs_v1::ScopeLogs.new(
-              scope: common_v1::InstrumentationScope.new(name: @scope_name),
+              scope: common_v1::InstrumentationScope.new(name: utf8_string(@scope_name)),
               log_records: log_records
             )
           ]
@@ -74,8 +74,8 @@ class Fluent::Plugin::Opentelemetry::LogRecordBuilder
 
     severity_present, severity = record_value(record, @severity_key)
     if severity_present
-      values[:severity_text] = severity.to_s
-      values[:severity_number] = SEVERITY_NUMBERS.fetch(severity.to_s.upcase, 0)
+      values[:severity_text] = utf8_string(severity.to_s)
+      values[:severity_number] = SEVERITY_NUMBERS.fetch(values[:severity_text].upcase, 0)
     end
 
     logs_v1::LogRecord.new(**values)
@@ -89,8 +89,8 @@ class Fluent::Plugin::Opentelemetry::LogRecordBuilder
     end
 
     body_present, body_value = record_value(record, @body_key)
-    text = body_present ? body_value.to_s : JSON.generate(record)
-    common_v1::AnyValue.new(string_value: text)
+    text = body_present ? body_value.to_s : JSON.generate(normalize_json_strings(record))
+    common_v1::AnyValue.new(string_value: utf8_string(text))
   end
 
   def log_attributes(tag, record)
@@ -125,19 +125,19 @@ class Fluent::Plugin::Opentelemetry::LogRecordBuilder
 
   def key_values(values)
     values.map do |key, value|
-      common_v1::KeyValue.new(key: key.to_s, value: any_value(value))
+      common_v1::KeyValue.new(key: utf8_string(key.to_s), value: any_value(value))
     end
   end
 
   def any_value(value)
     case value
     when String
-      common_v1::AnyValue.new(string_value: value)
+      common_v1::AnyValue.new(string_value: utf8_string(value))
     when Integer
       if INT64_RANGE.cover?(value)
         common_v1::AnyValue.new(int_value: value)
       else
-        common_v1::AnyValue.new(string_value: value.to_s)
+        common_v1::AnyValue.new(string_value: utf8_string(value.to_s))
       end
     when Float
       common_v1::AnyValue.new(double_value: value)
@@ -154,7 +154,36 @@ class Fluent::Plugin::Opentelemetry::LogRecordBuilder
     when NilClass
       common_v1::AnyValue.new(string_value: "null")
     else
-      common_v1::AnyValue.new(string_value: value.to_s)
+      common_v1::AnyValue.new(string_value: utf8_string(value.to_s))
+    end
+  end
+
+  def utf8_string(string)
+    return string if string.encoding == Encoding::UTF_8 && string.valid_encoding?
+
+    string = if string.encoding == Encoding::ASCII_8BIT
+               string.dup.force_encoding(Encoding::UTF_8)
+             elsif string.encoding != Encoding::UTF_8
+               string.encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: "\uFFFD")
+             else
+               string
+             end
+    string.scrub("\uFFFD")
+  end
+
+  def normalize_json_strings(value)
+    case value
+    when String
+      utf8_string(value)
+    when Hash
+      value.each_with_object({}) do |(key, item), result|
+        normalized_key = key.is_a?(String) ? utf8_string(key) : key
+        result[normalized_key] = normalize_json_strings(item)
+      end
+    when Array
+      value.map { |item| normalize_json_strings(item) }
+    else
+      value
     end
   end
 

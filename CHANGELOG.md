@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+- Normalize log strings to valid UTF-8 without mutating records, preventing binary or invalid bytes from dropping whole chunks.
+
 ## [0.1.0] - 2026-09-02
 
 - Add secret-masked authentication headers for HTTP and lowercase gRPC metadata.
