@@ -50,17 +50,20 @@ class OpentelemetryTransportTest < Test::Unit::TestCase
 
   def teardown
     Excon.stubs.clear
+    @grpc_handlers&.each { |h| h.instance_variable_get(:@channel).close }
   end
 
   def driver(protocol = :http, extra: "", section: "", endpoint: nil)
     endpoint ||= protocol == :http ? "http://127.0.0.1:4318" : "127.0.0.1:4317"
-    Fluent::Test::Driver::Output.new(Output).configure(<<~CONF)
+    d = Fluent::Test::Driver::Output.new(Output).configure(<<~CONF)
       #{extra}
       <#{protocol}>
         endpoint #{endpoint}
         #{section}
       </#{protocol}>
     CONF
+    (@grpc_handlers ||= []) << handler(d, :grpc) if protocol == :grpc
+    d
   end
 
   def handler(driver, protocol = :http)
@@ -373,6 +376,19 @@ class OpentelemetryTransportTest < Test::Unit::TestCase
     end
   end
 
+  def test_grpc_mismatched_pair_at_configure_time_is_passed_through_as_in_0_1_0
+    with_pems do |paths, _, cert|
+      other_key = OpenSSL::PKey::RSA.new(2048)
+      File.write(paths[:key], other_key.to_pem)
+      calls = []
+      original = GRPC::Core::ChannelCredentials.method(:new)
+      replace_method(GRPC::Core::ChannelCredentials, :new, ->(*args) { calls << args; original.call(*args) }) do
+        driver(:grpc, extra: "<transport tls>\n cert_path #{paths[:cert]}\n private_key_path #{paths[:key]}\n</transport>")
+      end
+      assert_equal [[nil, other_key.to_pem, cert.to_pem]], calls
+    end
+  end
+
   def test_grpc_key_without_client_certificate_is_config_error
     with_pems do |paths, _, _|
       error = assert_raise(Fluent::ConfigError) do
@@ -386,27 +402,35 @@ class OpentelemetryTransportTest < Test::Unit::TestCase
     services = [Otel::GrpcOutputHandler::ServiceStub::Logs, Otel::GrpcOutputHandler::ServiceStub::Metrics,
                 Otel::GrpcOutputHandler::ServiceStub::Traces]
     calls = []
+    channel_calls = []
+    original = GRPC::Core::Channel.method(:new)
+    channel_constructor = ->(*args) { channel_calls << args; original.call(*args) }
     replacement = ->(*args, **options) { calls << [args, options]; CapturingService.new }
-    replace_method(services[0], :new, replacement) do
-      replace_method(services[1], :new, replacement) do
-        replace_method(services[2], :new, replacement) do
-          d = driver(:grpc, section: "compress gzip\n keepalive_time 45\n keepalive_timeout 12")
-          h = handler(d, :grpc)
-          2.times do
-            h.export_logs(request)
-            %w[logs metrics traces].each { |type| h.export(relay(type)) }
+    replace_method(GRPC::Core::Channel, :new, channel_constructor) do
+      replace_method(services[0], :new, replacement) do
+        replace_method(services[1], :new, replacement) do
+          replace_method(services[2], :new, replacement) do
+            d = driver(:grpc, section: "compress gzip\n keepalive_time 45\n keepalive_timeout 12")
+            h = handler(d, :grpc)
+            2.times do
+              h.export_logs(request)
+              %w[logs metrics traces].each { |type| h.export(relay(type)) }
+            end
+            assert_equal [h.instance_variable_get(:@channel)], calls.map { |_, options| options[:channel_override] }.uniq
           end
         end
       end
     end
     assert_equal 3, calls.size
+    assert_equal 1, channel_calls.size
+    expected = GRPC::Core::CompressionOptions.new(default_algorithm: :gzip).to_channel_arg_hash.merge(
+      "grpc.keepalive_time_ms" => 45_000, "grpc.keepalive_timeout_ms" => 12_000,
+      "grpc.keepalive_permit_without_calls" => 1, "grpc.primary_user_agent" => "grpc-ruby/#{GRPC::VERSION}"
+    )
+    assert_equal ["127.0.0.1:4317", expected, :this_channel_is_insecure], channel_calls.first
     calls.each do |args, options|
       assert_equal ["127.0.0.1:4317", :this_channel_is_insecure], args
-      expected = GRPC::Core::CompressionOptions.new(default_algorithm: :gzip).to_channel_arg_hash.merge(
-        "grpc.keepalive_time_ms" => 45_000, "grpc.keepalive_timeout_ms" => 12_000,
-        "grpc.keepalive_permit_without_calls" => 1
-      )
-      assert_equal expected, options[:channel_args]
+      assert_equal [:channel_override], options.keys
     end
   end
 
@@ -530,5 +554,440 @@ class OpentelemetryTransportTest < Test::Unit::TestCase
       thread.join(5)
       thread.kill.join if thread.alive?
     end
+  end
+
+  def tls_config(paths, passphrase: nil)
+    <<~CONF
+      <transport tls>
+        ca_path #{paths[:ca]}
+        cert_path #{paths[:cert]}
+        private_key_path #{paths[:key]}
+        #{"private_key_passphrase #{passphrase}" if passphrase}
+      </transport>
+    CONF
+  end
+
+  def replace_methods(replacements, &block)
+    return block.call if replacements.empty?
+
+    receiver, name, replacement = replacements.first
+    replace_method(receiver, name, replacement) { replace_methods(replacements.drop(1), &block) }
+  end
+
+  def with_grpc_spies
+    credentials, channels, services = [], [], []
+    original_credentials = GRPC::Core::ChannelCredentials.method(:new)
+    original_channel = GRPC::Core::Channel.method(:new)
+    replacements = [
+      [GRPC::Core::ChannelCredentials, :new, ->(*args) { credentials << args; original_credentials.call(*args) }],
+      [GRPC::Core::Channel, :new, ->(*args) { original_channel.call(*args).tap { |channel| channels << channel } }]
+    ]
+    [Otel::GrpcOutputHandler::ServiceStub::Logs, Otel::GrpcOutputHandler::ServiceStub::Metrics,
+     Otel::GrpcOutputHandler::ServiceStub::Traces].each do |klass|
+      replacements << [klass, :new, ->(*, **options) {
+        service = CapturingService.new
+        services << [service, options.fetch(:channel_override)]
+        service
+      }]
+    end
+    replace_methods(replacements) { yield credentials, channels, services }
+  ensure
+    channels&.each(&:close)
+  end
+
+  def assert_channel_closed(channel)
+    error = assert_raise(RuntimeError) { channel.connectivity_state }
+    assert_equal "closed!", error.message
+  end
+
+  def tls_warnings(d)
+    d.logs.grep(/keeping the current gRPC channel/)
+  end
+
+  def test_grpc_unchanged_tls_files_do_not_rebuild_or_warn
+    with_pems do |paths, _, _|
+      with_grpc_spies do |credentials, channels, services|
+        d = driver(:grpc, extra: tls_config(paths))
+        h = handler(d, :grpc)
+        10.times do
+          h.export_logs(request)
+          %w[logs metrics traces].each { |type| h.export(relay(type)) }
+        end
+        assert_equal 1, credentials.size
+        assert_equal 1, channels.size
+        assert_equal [20, 10, 10], services.map { |service, _| service.calls.size }
+        expected = { ca_path: paths[:ca], cert_path: paths[:cert], private_key_path: paths[:key] }
+          .transform_values { |path| Digest::SHA256.hexdigest(File.binread(path)) }
+        assert_equal expected, h.instance_variable_get(:@tls_fingerprints)
+        assert_empty tls_warnings(d)
+        assert_empty d.logs.grep(/gRPC TLS files changed/)
+      end
+    end
+  end
+
+  def test_grpc_changed_client_pair_rebuilds_all_stubs_once_and_closes_old_channel
+    with_pems do |paths, _, _|
+      with_pems do |_, key, cert|
+        with_grpc_spies do |credentials, channels, services|
+          d = driver(:grpc, extra: tls_config(paths))
+          h = handler(d, :grpc)
+          h.export_logs(request)
+          File.write(paths[:cert], cert.to_pem)
+          File.write(paths[:key], key.to_pem)
+          h.export_logs(request)
+          %w[logs metrics traces].each { |type| h.export(relay(type)) }
+          assert_equal 2, credentials.size
+          assert_equal [File.binread(paths[:ca]), key.to_pem, cert.to_pem], credentials.last
+          assert_equal 2, channels.size
+          assert_channel_closed(channels.first)
+          assert_nothing_raised { channels.last.connectivity_state }
+          assert_equal [1, 0, 0, 2, 1, 1], services.map { |service, _| service.calls.size }
+          assert_equal [channels.last] * 3, services.last(3).map(&:last)
+          assert_equal 1, d.logs.grep(/gRPC TLS files changed/).size
+          assert_empty tls_warnings(d)
+        end
+      end
+    end
+  end
+
+  def test_grpc_changed_ca_only_rebuilds_on_relay_export
+    with_pems do |paths, key, cert|
+      with_pems do |_, _, new_ca|
+        with_grpc_spies do |credentials, channels, _|
+          d = driver(:grpc, extra: tls_config(paths))
+          h = handler(d, :grpc)
+          updated_ca = new_ca.to_pem
+          File.write(paths[:ca], updated_ca)
+          h.export(relay("metrics"))
+          h.export_logs(request)
+          assert_equal 2, credentials.size
+          assert_equal [updated_ca, key.to_pem, cert.to_pem], credentials.last
+          assert_channel_closed(channels.first)
+          assert_equal 1, d.logs.grep(/gRPC TLS files changed/).size
+        end
+      end
+    end
+  end
+
+  def test_grpc_repeated_rotations_close_every_retired_channel
+    with_pems do |paths, _, _|
+      with_grpc_spies do |credentials, channels, _|
+        d = driver(:grpc, extra: tls_config(paths))
+        h = handler(d, :grpc)
+        5.times do
+          File.write(paths[:ca], File.binread(paths[:ca]) + "\n")
+          h.export_logs(request)
+        end
+        assert_equal 6, credentials.size
+        assert_equal 6, channels.size
+        channels[0...-1].each { |channel| assert_channel_closed(channel) }
+        assert_nothing_raised { channels.last.connectivity_state }
+        assert_equal 5, d.logs.grep(/gRPC TLS files changed/).size
+        assert_empty tls_warnings(d)
+      end
+    end
+  end
+
+  def test_grpc_kubernetes_secret_symlink_swap_rebuilds_once
+    with_pems do |paths, _, _|
+      with_pems do |replacement_paths, _, _|
+        dir = File.dirname(paths[:ca])
+        %w[..version1 ..version2].each { |name| Dir.mkdir(File.join(dir, name)) }
+        paths.each do |kind, path|
+          File.rename(path, File.join(dir, "..version1", File.basename(path)))
+          File.write(File.join(dir, "..version2", File.basename(path)), File.binread(replacement_paths[kind]))
+          File.symlink(File.join("..data", File.basename(path)), path)
+        end
+        File.symlink("..version1", File.join(dir, "..data"))
+        with_grpc_spies do |credentials, channels, _|
+          d = driver(:grpc, extra: tls_config(paths))
+          h = handler(d, :grpc)
+          File.symlink("..version2", File.join(dir, "..data_tmp"))
+          File.rename(File.join(dir, "..data_tmp"), File.join(dir, "..data"))
+          3.times { h.export_logs(request) }
+          assert_equal 2, credentials.size
+          assert_equal replacement_paths.values_at(:ca, :key, :cert).map { |path| File.binread(path) }, credentials.last
+          assert_channel_closed(channels.first)
+          assert_equal 1, d.logs.grep(/gRPC TLS files changed/).size
+        end
+      end
+    end
+  end
+
+  def test_grpc_missing_file_keeps_old_stub_warns_once_and_recovers
+    with_pems do |paths, _, _|
+      with_grpc_spies do |credentials, channels, services|
+        d = driver(:grpc, extra: tls_config(paths))
+        h = handler(d, :grpc)
+        ca = File.binread(paths[:ca])
+        File.unlink(paths[:ca])
+        3.times { h.export_logs(request) }
+        assert_equal 3, services.first.first.calls.size
+        assert_equal 1, credentials.size
+        assert_nothing_raised { channels.first.connectivity_state }
+        assert_equal 1, tls_warnings(d).size
+        assert_include tls_warnings(d).first, paths[:ca]
+        File.write(paths[:ca], ca + "\n")
+        h.export_logs(request)
+        assert_equal 2, credentials.size
+        assert_equal 1, services[3].first.calls.size
+        assert_channel_closed(channels.first)
+        File.unlink(paths[:ca])
+        h.export_logs(request)
+        assert_equal 2, tls_warnings(d).size
+      end
+    end
+  end
+
+  def test_grpc_invalid_rotated_pair_and_bad_passphrase_keep_old_stub_and_warn_once
+    with_pems do |paths, key, cert|
+      with_pems do |_, other_key, _|
+        with_grpc_spies do |credentials, channels, services|
+          d = driver(:grpc, extra: tls_config(paths, passphrase: "test-passphrase"))
+          h = handler(d, :grpc)
+          File.write(paths[:key], other_key.to_pem)
+          2.times { h.export_logs(request) }
+          assert_equal 1, tls_warnings(d).size
+          assert_include tls_warnings(d).first, paths[:key]
+          assert_include tls_warnings(d).first, paths[:cert]
+          File.write(paths[:key], key.export(OpenSSL::Cipher.new("aes-256-cbc"), "different-passphrase"))
+          2.times { h.export(relay) }
+          assert_equal 2, tls_warnings(d).size
+          assert_include tls_warnings(d).last, paths[:key]
+          assert_equal 1, credentials.size
+          assert_equal 4, services.first.first.calls.size
+          assert_nothing_raised { channels.first.connectivity_state }
+          [key.to_pem, other_key.to_pem, cert.to_pem, "test-passphrase", "different-passphrase"].each do |secret|
+            assert_not_include d.logs.join, secret
+          end
+          File.write(paths[:key], key.export(OpenSSL::Cipher.new("aes-256-cbc"), "test-passphrase"))
+          h.export_logs(request)
+          assert_equal 2, credentials.size
+          assert_equal key.to_pem, credentials.last[1]
+          assert_channel_closed(channels.first)
+        end
+      end
+    end
+  end
+
+  def test_grpc_distinct_read_failures_warn_once_each_until_a_successful_check
+    with_pems do |paths, _, _|
+      with_grpc_spies do |_, _, _|
+        d = driver(:grpc, extra: tls_config(paths))
+        h = handler(d, :grpc)
+        ca, key = File.binread(paths[:ca]), File.binread(paths[:key])
+        File.unlink(paths[:key])
+        h.export_logs(request)
+        File.unlink(paths[:ca])
+        h.export_logs(request)
+        File.write(paths[:ca], ca)
+        h.export_logs(request)
+        assert_equal 2, tls_warnings(d).size
+        File.write(paths[:key], key)
+        h.export_logs(request)
+        File.unlink(paths[:key])
+        h.export_logs(request)
+        assert_equal 3, tls_warnings(d).size
+      end
+    end
+  end
+
+  def test_grpc_concurrent_exports_rebuild_exactly_once
+    with_pems do |paths, _, _|
+      with_grpc_spies do |credentials, channels, services|
+        d = driver(:grpc, extra: tls_config(paths))
+        h = handler(d, :grpc)
+        File.write(paths[:ca], File.binread(paths[:ca]) + "\n")
+        ready, start = Queue.new, Queue.new
+        threads = 8.times.map do |index|
+          Thread.new do
+            ready << true
+            start.pop
+            index.even? ? h.export_logs(request) : h.export(relay)
+          end
+        end
+        Timeout.timeout(3) { 8.times { ready.pop } }
+        8.times { start << true }
+        Timeout.timeout(3) { threads.each(&:value) }
+        assert_equal 2, credentials.size
+        assert_equal 2, channels.size
+        assert_equal 8, services[3].first.calls.size
+        assert_equal 1, d.logs.grep(/gRPC TLS files changed/).size
+        assert_channel_closed(channels.first)
+      ensure
+        threads&.each { |thread| thread.kill.join if thread.alive? }
+      end
+    end
+  end
+
+  def test_grpc_rotation_defers_old_channel_close_until_its_active_export_finishes
+    with_pems do |paths, _, _|
+      with_grpc_spies do |_, channels, services|
+        d = driver(:grpc, extra: tls_config(paths))
+        h = handler(d, :grpc)
+        entered, finish = Queue.new, Queue.new
+        services.first.first.define_singleton_method(:export_request) do |*, **|
+          entered << true
+          finish.pop
+          Otel::Response::Logs.build
+        end
+        thread = Thread.new { h.export_logs(request) }
+        Timeout.timeout(3) { entered.pop }
+        File.write(paths[:ca], File.binread(paths[:ca]) + "\n")
+        h.export_logs(request)
+        assert_nothing_raised { channels.first.connectivity_state }
+        finish << true
+        Timeout.timeout(3) { thread.value }
+        assert_channel_closed(channels.first)
+        assert_nothing_raised { channels.last.connectivity_state }
+      ensure
+        thread.kill.join if thread&.alive?
+      end
+    end
+  end
+
+  def test_grpc_failed_stub_construction_closes_candidate_channel_and_keeps_old_stubs
+    with_pems do |paths, _, _|
+      with_grpc_spies do |_, channels, services|
+        d = driver(:grpc, extra: tls_config(paths))
+        h = handler(d, :grpc)
+        File.write(paths[:ca], File.binread(paths[:ca]) + "\n")
+        replace_method(Otel::GrpcOutputHandler::ServiceStub::Metrics, :new, ->(*) { raise "test construction failure" }) do
+          2.times { h.export_logs(request) }
+        end
+        assert_equal 2, services.first.first.calls.size
+        assert_equal 1, tls_warnings(d).size
+        channels.drop(1).each { |channel| assert_channel_closed(channel) }
+        assert_nothing_raised { channels.first.connectivity_state }
+        h.export_logs(request)
+        assert_channel_closed(channels.first)
+        assert_nothing_raised { channels.last.connectivity_state }
+      end
+    end
+  end
+
+  def test_grpc_plaintext_exports_never_read_tls_files
+    with_grpc_spies do |credentials, _, _|
+      d = driver(:grpc)
+      h = handler(d, :grpc)
+      no_read = ->(*) { flunk "plaintext export read a TLS file" }
+      replace_methods([[File, :read, no_read], [File, :binread, no_read]]) do
+        3.times do
+          h.export_logs(request)
+          %w[logs metrics traces].each { |type| h.export(relay(type)) }
+        end
+      end
+      assert_empty credentials
+      assert_empty tls_warnings(d)
+    end
+  end
+
+  def issue_certificate(name, issuer: nil, purpose: nil)
+    key = OpenSSL::PKey::RSA.new(2048)
+    cert = OpenSSL::X509::Certificate.new
+    cert.version = 2
+    cert.serial = OpenSSL::BN.rand(64).to_i
+    cert.subject = OpenSSL::X509::Name.parse("/CN=#{name}")
+    cert.issuer = issuer ? issuer.last.subject : cert.subject
+    cert.public_key = key.public_key
+    cert.not_before = Time.now - 60
+    cert.not_after = Time.now + 3600
+    extensions = OpenSSL::X509::ExtensionFactory.new
+    extensions.subject_certificate = cert
+    extensions.issuer_certificate = issuer ? issuer.last : cert
+    cert.add_extension(extensions.create_extension("basicConstraints", issuer ? "CA:FALSE" : "CA:TRUE", true))
+    cert.add_extension(extensions.create_extension("keyUsage", issuer ? "digitalSignature,keyEncipherment" : "keyCertSign,cRLSign", true))
+    cert.add_extension(extensions.create_extension("extendedKeyUsage", purpose)) if purpose
+    cert.add_extension(extensions.create_extension("subjectAltName", "IP:127.0.0.1")) if purpose == "serverAuth"
+    cert.sign(issuer ? issuer.first : key, OpenSSL::Digest.new("SHA256"))
+    [key, cert]
+  end
+
+  def start_mtls_server(port, server_pair, client_ca)
+    key, cert = server_pair
+    credentials = GRPC::Core::ServerCredentials.new(
+      client_ca.to_pem, [{ private_key: key.to_pem, cert_chain: cert.to_pem }], true
+    )
+    server = GRPC::RpcServer.new(poll_period: 0.1, pool_keep_alive: 0.1)
+    bound_port = server.add_http2_port("127.0.0.1:#{port}", credentials)
+    assert_operator bound_port, :>, 0
+    assert_equal port, bound_port unless port.zero?
+    service = ReceivingLogs.new
+    server.handle(service)
+    thread = Thread.new { server.run_till_terminated }
+    assert server.wait_till_running(2), "local mutual TLS server did not start"
+    [server, thread, service, bound_port]
+  rescue StandardError
+    stop_mtls_server(server, thread)
+    raise
+  end
+
+  def stop_mtls_server(server, thread)
+    server&.stop if server&.running?
+    return unless thread
+
+    assert thread.join(2), "local mutual TLS server did not stop"
+    thread.value
+  ensure
+    thread.kill.join if thread&.alive?
+  end
+
+  def test_real_mtls_grpc_rotation_reconnects_to_same_endpoint_without_recreating_handler
+    begin
+      probe = TCPServer.new("127.0.0.1", 0)
+      probe.close
+    rescue Errno::EPERM, Errno::EACCES => e
+      omit("sandbox forbids the local TCP listener required by the mutual TLS rotation test: #{e.message}")
+    end
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    server_ca = issue_certificate("server CA S")
+    client_ca_a = issue_certificate("client CA A")
+    client_ca_b = issue_certificate("client CA B")
+    server_pair = issue_certificate("localhost", issuer: server_ca, purpose: "serverAuth")
+    client_a = issue_certificate("client A", issuer: client_ca_a, purpose: "clientAuth")
+    client_b = issue_certificate("client B", issuer: client_ca_b, purpose: "clientAuth")
+    Dir.mktmpdir("otel-mtls-rotation-") do |dir|
+      paths = { ca: File.join(dir, "ca.pem"), cert: File.join(dir, "client.pem"), key: File.join(dir, "client-key.pem") }
+      File.write(paths[:ca], server_ca.last.to_pem)
+      File.write(paths[:cert], client_a.last.to_pem)
+      File.write(paths[:key], client_a.first.to_pem, perm: 0o600)
+      server, thread, service, port = start_mtls_server(0, server_pair, client_ca_a.last)
+      d = driver(:grpc, endpoint: "127.0.0.1:#{port}", section: "timeout 1", extra: tls_config(paths))
+      h = handler(d, :grpc)
+      original_channel = h.instance_variable_get(:@channel)
+      expected = request
+      h.export_logs(expected)
+      assert_equal expected, Timeout.timeout(1) { service.received.pop }.first
+      stop_mtls_server(server, thread)
+      server, thread, service, bound_port = start_mtls_server(port, server_pair, client_ca_b.last)
+      assert_equal port, bound_port
+
+      # Unchanged files keep the A credentials, which the B-only server rejects.
+      error = assert_raise(Output::RetryableResponse) { h.export_logs(expected) }
+      assert_match(/UNAVAILABLE|DEADLINE_EXCEEDED/, error.message)
+      assert service.received.empty?
+      assert_same original_channel, h.instance_variable_get(:@channel)
+      assert_empty d.logs.grep(/gRPC TLS files changed/)
+
+      File.write(paths[:cert], client_b.last.to_pem)
+      File.write(paths[:key], client_b.first.to_pem)
+      begin
+        h.export_logs(expected)
+      rescue Output::RetryableResponse
+        h.export_logs(expected)
+      end
+      assert_equal expected, Timeout.timeout(1) { service.received.pop }.first
+      assert_not_same original_channel, h.instance_variable_get(:@channel)
+      assert_channel_closed(original_channel)
+      h.export(relay("logs", expected.to_json))
+      assert_equal expected, Timeout.timeout(1) { service.received.pop }.first
+      assert_equal 1, d.logs.grep(/gRPC TLS files changed/).size
+      assert_empty tls_warnings(d)
+    ensure
+      stop_mtls_server(server, thread)
+      h&.instance_variable_get(:@channel)&.close
+    end
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    assert_operator elapsed, :<, 10, "mutual TLS rotation test took #{elapsed.round(2)} seconds"
   end
 end

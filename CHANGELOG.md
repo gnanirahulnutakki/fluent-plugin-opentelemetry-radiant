@@ -1,9 +1,11 @@
-## [Unreleased]
+## [0.1.1] - 2026-10-28
+
+- Check gRPC TLS files before each export and reconnect when certificates or
+  keys change, without a Fluentd reload or restart. Keep the current channel if the new files cannot be loaded.
+
+## [0.1.0] - 2026-10-27
 
 - Normalize log strings to valid UTF-8 without mutating records, preventing binary or invalid bytes from dropping whole chunks.
-
-## [0.1.0] - 2026-09-02
-
 - Add secret-masked authentication headers for HTTP and lowercase gRPC metadata.
 - Add HTTP CA and mutual TLS settings without changing global Excon defaults;
   warn once at start when HTTP certificate verification is disabled.

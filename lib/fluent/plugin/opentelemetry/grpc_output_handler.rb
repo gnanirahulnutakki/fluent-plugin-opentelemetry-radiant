@@ -19,6 +19,8 @@ require "opentelemetry/proto/collector/trace/v1/trace_service_services_pb"
 require "fluent/plugin/opentelemetry/constant"
 require "fluent/plugin/opentelemetry/output_response"
 require "google/protobuf"
+require "digest"
+require "set"
 
 class Fluent::Plugin::Opentelemetry::GrpcOutputHandler
   include Fluent::Plugin::Opentelemetry::OutputResponse
@@ -29,6 +31,8 @@ class Fluent::Plugin::Opentelemetry::GrpcOutputHandler
   CODE_NAMES = GRPC::Core::StatusCodes.constants.to_h do |name|
     [GRPC::Core::StatusCodes.const_get(name), name.to_s]
   end.freeze
+
+  class TlsFileError < StandardError; end
 
   class ServiceStub
     class Logs
@@ -82,26 +86,38 @@ class Fluent::Plugin::Opentelemetry::GrpcOutputHandler
       raise Fluent::ConfigError, "certificate verification cannot be turned off for gRPC; set ca_path to the server's CA instead"
     end
 
-    credential = channel_credentials(transport_config)
-    channel_args = {}
-    if grpc_config.compress == :gzip
-      channel_args = GRPC::Core::CompressionOptions.new(default_algorithm: :gzip).to_channel_arg_hash
+    @transport_config = transport_config
+    @tls_mutex = Mutex.new
+    @active_exports = Hash.new(0)
+    @tls_failures = Set.new
+    if transport_config&.protocol == :tls
+      @tls_paths = {
+        ca_path: transport_config.ca_path, cert_path: transport_config.cert_path,
+        private_key_path: transport_config.private_key_path
+      }.compact
     end
-    channel_args["grpc.keepalive_time_ms"] = grpc_config.keepalive_time * 1000
-    channel_args["grpc.keepalive_timeout_ms"] = grpc_config.keepalive_timeout * 1000
-    channel_args["grpc.keepalive_permit_without_calls"] = 1
-    @services = {
-      Fluent::Plugin::Opentelemetry::RECORD_TYPE_LOGS => ServiceStub::Logs.new(grpc_config.endpoint, credential, channel_args: channel_args),
-      Fluent::Plugin::Opentelemetry::RECORD_TYPE_METRICS => ServiceStub::Metrics.new(grpc_config.endpoint, credential, channel_args: channel_args),
-      Fluent::Plugin::Opentelemetry::RECORD_TYPE_TRACES => ServiceStub::Traces.new(grpc_config.endpoint, credential, channel_args: channel_args)
-    }
+    pems = read_tls_files if @tls_paths
+    credential = channel_credentials(pems)
+    @tls_fingerprints = fingerprints(pems) if @tls_paths
+    @channel_args = {}
+    if grpc_config.compress == :gzip
+      @channel_args = GRPC::Core::CompressionOptions.new(default_algorithm: :gzip).to_channel_arg_hash
+    end
+    @channel_args["grpc.keepalive_time_ms"] = grpc_config.keepalive_time * 1000
+    @channel_args["grpc.keepalive_timeout_ms"] = grpc_config.keepalive_timeout * 1000
+    @channel_args["grpc.keepalive_permit_without_calls"] = 1
+    @channel_args["grpc.primary_user_agent"] = "grpc-ruby/#{GRPC::VERSION}"
+    @channel, @services = build_services(credential)
+  rescue TlsFileError => e
+    raise Fluent::ConfigError, e.message, cause: nil
   end
 
   def export(record)
-    service = @services[record["type"]]
-    raise Fluent::UnrecoverableError, "got unknown record type '#{record['type']}'" unless service
+    response = with_service(record["type"]) do |service|
+      raise Fluent::UnrecoverableError, "got unknown record type '#{record['type']}'" unless service
 
-    response = service.export(record["message"], **call_options)
+      service.export(record["message"], **call_options)
+    end
     warn_partial_success(response) if record["type"] == Fluent::Plugin::Opentelemetry::RECORD_TYPE_LOGS
   rescue Google::Protobuf::ParseError => e
     raise Fluent::UnrecoverableError, e.message
@@ -111,7 +127,9 @@ class Fluent::Plugin::Opentelemetry::GrpcOutputHandler
   end
 
   def export_logs(request)
-    response = logs_service.export_request(request, **call_options)
+    response = with_service(Fluent::Plugin::Opentelemetry::RECORD_TYPE_LOGS) do |service|
+      service.export_request(request, **call_options)
+    end
     warn_partial_success(response)
   rescue GRPC::BadStatus => e
     code_name = CODE_NAMES.fetch(e.code, e.code.to_s)
@@ -128,34 +146,121 @@ class Fluent::Plugin::Opentelemetry::GrpcOutputHandler
     @services.fetch(Fluent::Plugin::Opentelemetry::RECORD_TYPE_LOGS)
   end
 
+  def service_for(type)
+    type == Fluent::Plugin::Opentelemetry::RECORD_TYPE_LOGS ? logs_service : @services[type]
+  end
+
+  def with_service(type)
+    return yield service_for(type) unless @tls_paths
+
+    channel = nil
+    service = @tls_mutex.synchronize do
+      refresh_tls_files
+      channel = @channel
+      @active_exports[channel] += 1
+      service_for(type)
+    end
+    yield service
+  ensure
+    if channel
+      @tls_mutex.synchronize do
+        @active_exports[channel] -= 1
+        if @active_exports[channel].zero?
+          @active_exports.delete(channel)
+          channel.close unless channel.equal?(@channel)
+        end
+      end
+    end
+  end
+
+  def build_services(credential)
+    channel = GRPC::Core::Channel.new(@grpc_config.endpoint, @channel_args, credential)
+    options = { channel_override: channel }
+    services = {
+      Fluent::Plugin::Opentelemetry::RECORD_TYPE_LOGS => ServiceStub::Logs.new(@grpc_config.endpoint, credential, **options),
+      Fluent::Plugin::Opentelemetry::RECORD_TYPE_METRICS => ServiceStub::Metrics.new(@grpc_config.endpoint, credential, **options),
+      Fluent::Plugin::Opentelemetry::RECORD_TYPE_TRACES => ServiceStub::Traces.new(@grpc_config.endpoint, credential, **options)
+    }
+    [channel, services]
+  rescue StandardError
+    channel&.close
+    raise
+  end
+
+  def refresh_tls_files
+    begin
+      pems = read_tls_files
+      current = fingerprints(pems)
+      if current != @tls_fingerprints
+        channel, services = build_services(channel_credentials(pems, rotation: true))
+        old_channel = @channel
+        @channel, @services, @tls_fingerprints = channel, services, current
+      end
+    rescue StandardError => e
+      message = e.is_a?(TlsFileError) ? e.message : "could not rebuild gRPC TLS channel for #{@tls_paths.values.join(', ')} (#{e.class})"
+      failure = [message, current]
+      if @tls_failures.add?(failure)
+        @logger.warn "#{message}; keeping the current gRPC channel and retrying the TLS files on the next export"
+      end
+      return
+    end
+    @tls_failures.clear
+    return unless old_channel
+
+    @logger.info "gRPC TLS files changed; reconnecting with the updated certificate files"
+    # Let calls that already selected the old stubs finish before closing them.
+    old_channel.close unless @active_exports.key?(old_channel)
+  end
+
   def call_options
     { deadline: Time.now + @grpc_config.timeout, metadata: @metadata }
   end
 
-  def channel_credentials(transport)
-    return :this_channel_is_insecure unless transport&.protocol == :tls
+  def channel_credentials(pems, rotation: false)
+    return :this_channel_is_insecure unless @tls_paths
 
-    ca_pem = read_pem(transport.ca_path)
-    key_pem = read_pem(transport.private_key_path)
-    cert_pem = read_pem(transport.cert_path)
+    transport = @transport_config
+    ca_pem, key_pem, cert_pem = pems.values_at(:ca_path, :private_key_path, :cert_path)
     if key_pem.nil? != cert_pem.nil?
-      raise Fluent::ConfigError, "gRPC TLS requires both cert_path and private_key_path for a client certificate"
+      raise TlsFileError, "gRPC TLS requires both cert_path and private_key_path for a client certificate"
     end
-    if key_pem && transport.private_key_passphrase
+    # Configure-time checks stay as in 0.1.0. A rotation replaces a working
+    # channel, so it also requires a parseable key that matches the certificate.
+    if key_pem && (transport.private_key_passphrase || rotation)
       begin
-        key_pem = OpenSSL::PKey.read(key_pem, transport.private_key_passphrase).to_pem
+        key = OpenSSL::PKey.read(key_pem, transport.private_key_passphrase || "")
       rescue OpenSSL::OpenSSLError, ArgumentError
-        raise Fluent::ConfigError, "could not decrypt gRPC TLS private_key_path '#{transport.private_key_path}'", cause: nil
+        action = transport.private_key_passphrase ? "decrypt" : "read"
+        raise TlsFileError, "could not #{action} gRPC TLS private_key_path '#{transport.private_key_path}'", cause: nil
       end
     end
+    if key_pem && rotation
+      begin
+        valid_pair = OpenSSL::X509::Certificate.new(cert_pem).check_private_key(key)
+      rescue OpenSSL::OpenSSLError, ArgumentError
+        valid_pair = false
+      end
+      unless valid_pair
+        raise TlsFileError, "invalid gRPC TLS client certificate/key pair '#{transport.cert_path}' and '#{transport.private_key_path}'", cause: nil
+      end
+    end
+    key_pem = key.to_pem if key_pem && transport.private_key_passphrase
     GRPC::Core::ChannelCredentials.new(ca_pem, key_pem, cert_pem)
+  end
+
+  def read_tls_files
+    @tls_paths.transform_values { |path| read_pem(path) }
+  end
+
+  def fingerprints(pems)
+    pems.transform_values { |pem| Digest::SHA256.hexdigest(pem) }
   end
 
   def read_pem(path)
     return nil unless path
 
-    File.read(path)
+    File.binread(path)
   rescue SystemCallError, IOError
-    raise Fluent::ConfigError, "could not read gRPC TLS file '#{path}'", cause: nil
+    raise TlsFileError, "could not read gRPC TLS file '#{path}'", cause: nil
   end
 end

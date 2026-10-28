@@ -200,6 +200,14 @@ a `Fluent::ConfigError` identifying the path. An encrypted client key can use
 The HTTP `min_version` / `max_version` settings are not applied to gRPC, whose
 TLS negotiation is managed by gRPC core.
 
+**Certificate rotation.** HTTP opens new connections with the TLS files as they
+are on disk. gRPC checks the configured TLS files before each send and reconnects
+when their contents change. If the files cannot be read or the new credentials
+are invalid, gRPC warns and keeps its current channel, then checks again on the
+next send. Headers (including tokens) are read when the configuration loads, so
+a token change needs a config reload. Mount Kubernetes Secrets as a directory,
+not with `subPath`, because kubelet does not update `subPath` mounts.
+
 | gRPC option | Default | Meaning |
 |---|---|---|
 | `compress` | `text` | `text` sends uncompressed messages; `gzip` enables gRPC gzip compression. |
